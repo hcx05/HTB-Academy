@@ -10,7 +10,7 @@
 |------|------|
 | Q1 另一個設定 Kerberos constrained delegation 的使用者 | `adam.jones`（`svc-scan`，見下方說明） |
 | Q2 第二個 description 欄位含密碼的使用者密碼 | `W4y_am_I_d0ing_Th1s?`（`joel.johnson`） |
-| Q3 教材輸出沒列出、但有 SPN 的使用者 | `svc-scan` |
+| Q3 教材輸出沒列出、但有 SPN 的使用者 | `WSUSupdatesvc` |
 | Q4 Administrators 群組中來自其他網域的使用者 | `bob.barker`（`LOGISTICS.INLANEFREIGHT.LOCAL`） |
 
 > 教材範例輸出不在本機目錄中，所以「教材已列出哪些」（Q1 的 `sqlprod`、Q2 的第一組密碼、Q3 的清單）是依教材的印象判斷。若 Q1、Q2 的答案不被接受，請改交下面列出的另一個候選。
@@ -158,9 +158,13 @@ sqlprod       :: MSSQLSvc/sql01:1433
 svc-scan      :: scantest/inlanefreight.local
 ```
 
-教材範例列出的是 `sqldev`、`sqlprod`、`sqlqa`、`sql-test`、`adam.jones`、`krbtgt`、`WSUSupdatesvc` 這類帳號，唯一額外多出來的是 `svc-scan`（SPN `scantest/inlanefreight.local`）。
+**更正：** 一開始我交 `svc-scan`，被判錯，原因是教材輸出其實已經列出 `svc-scan`（Q1 的委派帳號同時也有 SPN `scantest/inlanefreight.local`），不算「沒列出」。
 
-**答案：`svc-scan`**
+8 個有 SPN 的帳號裡，剩下沒被教材輸出列出的是 `WSUSupdatesvc`（SPN `HTTP/WSUS01.inlanefreight.local:8530`）。題目又特別標示「區分大小寫」，而這個帳號是唯一大小寫混合的名稱，所以提示就是指它。
+
+**答案：`WSUSupdatesvc`**
+
+> 教訓：不能只看「清單中多出的名字」，要先確認教材範例輸出實際列了哪些帳號；題目的「case-sensitive」提示通常指向大小寫混合的帳號名。
 
 ---
 

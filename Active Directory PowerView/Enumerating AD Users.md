@@ -8,7 +8,7 @@
 
 | 題目 | 答案 |
 |------|------|
-| Q1 另一個設定 Kerberos constrained delegation 的使用者 | `adam.jones`（`svc-scan`，見下方說明） |
+| Q1 另一個設定 Kerberos constrained delegation 的使用者 | `svc-scan` |
 | Q2 第二個 description 欄位含密碼的使用者密碼 | `W4y_am_I_d0ing_Th1s?`（`joel.johnson`） |
 | Q3 教材輸出沒列出、但有 SPN 的使用者 | `WSUSupdatesvc` |
 | Q4 Administrators 群組中來自其他網域的使用者 | `bob.barker`（`LOGISTICS.INLANEFREIGHT.LOCAL`） |

